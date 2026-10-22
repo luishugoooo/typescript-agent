@@ -2,6 +2,28 @@ import { describe, expect, it } from 'vitest';
 import { ToolEventBroadcaster } from '../../src/lib/tool-event-broadcaster.js';
 
 describe('ToolEventBroadcaster', () => {
+  it('keeps the first terminal failure for active and late consumers', async () => {
+    const broadcaster = new ToolEventBroadcaster<number>();
+    const consumer = broadcaster.createConsumer();
+    const error = new Error('original failure');
+    const pending = expect(consumer.next()).rejects.toBe(error);
+    broadcaster.complete(error);
+    broadcaster.complete();
+    broadcaster.complete(new Error('later failure'));
+    await pending;
+    await expect(broadcaster.createConsumer().next()).rejects.toBe(error);
+  });
+
+  it('does not replace successful completion with a later error', async () => {
+    const broadcaster = new ToolEventBroadcaster<number>();
+    broadcaster.complete();
+    broadcaster.complete(new Error('late failure'));
+    await expect(broadcaster.createConsumer().next()).resolves.toEqual({
+      done: true,
+      value: undefined,
+    });
+  });
+
   it('retains full replay after completion by default', async () => {
     const broadcaster = new ToolEventBroadcaster<number>();
     const first = broadcaster.createConsumer();

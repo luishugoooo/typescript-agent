@@ -39,6 +39,11 @@ export class ToolEventBroadcaster<T> {
    * Cleans up buffer and consumers after completion.
    */
   complete(error?: Error): void {
+    // Multiple execution/pipe consumers can settle the same broadcaster.
+    // Preserve the first terminal outcome, including for late subscribers.
+    if (this.isComplete) {
+      return;
+    }
     this.isComplete = true;
     this.completionError = error ?? null;
     this.notifyWaitingConsumers();

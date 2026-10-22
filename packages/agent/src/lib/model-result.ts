@@ -1095,16 +1095,20 @@ export class ModelResult<
     const broadcaster = this.ensureTurnBroadcaster();
     this.startInitialStreamPipe();
     const consumer = broadcaster.createConsumer();
-    const executionPromise = this.executeToolsIfNeeded().finally(async () => {
-      // Wait for the initial stream pipe to finish pushing all events
-      // (including turn.end) before marking the broadcaster as complete.
-      // Without this, turn.end can be silently dropped if the pipe hasn't
-      // finished when executeToolsIfNeeded completes.
-      if (this.initialPipePromise) {
+    // The broadcaster owns stream failures. A detached rejecting promise would
+    // otherwise escape when a consumer throws, returns early, or is cancelled
+    // before reaching its trailing await. Non-streaming readers still await
+    // toolExecutionPromise directly and receive the original failure.
+    const executionPromise = this.executeToolsIfNeeded().then(
+      async () => {
+        // Flush initial events (including turn.end) before successful completion.
         await this.initialPipePromise;
-      }
-      broadcaster.complete();
-    });
+        broadcaster.complete();
+      },
+      (error: unknown) => {
+        broadcaster.complete(error instanceof Error ? error : new Error(String(error)));
+      },
+    );
     return {
       consumer,
       executionPromise,
