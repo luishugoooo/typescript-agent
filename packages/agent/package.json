@@ -1,6 +1,6 @@
 {
   "name": "@openrouter/agent",
-  "version": "0.11.0",
+  "version": "0.11.0-onwert.1",
   "author": "OpenRouter",
   "description": "Agent toolkit for building AI applications with OpenRouter — tool orchestration, streaming, multi-turn conversations, and format compatibility.",
   "keywords": [
@@ -153,7 +153,7 @@
   "sideEffects": false,
   "repository": {
     "type": "git",
-    "url": "https://github.com/OpenRouterTeam/typescript-agent.git",
+    "url": "https://github.com/luishugoooo/typescript-agent.git",
     "directory": "packages/agent"
   },
   "publishConfig": {
