@@ -197,6 +197,8 @@ export type {
   UserPromptSubmitResult,
 } from './lib/hooks-types.js';
 export { HookName, isAsyncOutput } from './lib/hooks-types.js';
+export type { ModelRetryEvent } from './lib/model-errors.js';
+export { isRetryableModelError, ModelRequestError } from './lib/model-errors.js';
 export type { GetResponseOptions } from './lib/model-result.js';
 export { DEFAULT_FINAL_RESPONSE_DIRECTIVE, ModelResult } from './lib/model-result.js';
 // Next turn params helpers

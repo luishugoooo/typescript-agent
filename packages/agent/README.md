@@ -127,6 +127,52 @@ What each stream emits:
 | `getItemsStream()` | all output items (messages, function calls, …) — output items **only**, no usage/response metadata |
 | `getFullResponsesStream()` | every response event, including `tool.result` / `tool.call_output` execution events, and each round's `response.completed` (with that round's usage block) |
 
+#### Complete-response transport and recovery
+
+Pass `stream: false` to receive a complete JSON response for every model step,
+including tool follow-ups, forced final answers and approval resumes. Streaming
+remains the default. `getItemsStream()` still delivers completed model items and
+tool results as the agent progresses; no model token deltas are generated in this
+mode. `getText()`, `getResponse()`, state persistence and usage accounting work as
+usual. Delta-only getters have no model deltas to emit in non-streaming mode.
+
+```ts
+const result = client.callModel({
+  model: 'openai/gpt-4.1',
+  input: 'Inspect the project and summarize the findings.',
+  tools,
+  stream: false,
+  responseRetries: 2,
+  onModelRetry: ({ error, attempt, delayMs }) => {
+    console.warn({ attempt, delayMs, ...error.details, message: error.message });
+  },
+}, { timeoutMs: 120_000 });
+for await (const item of result.getItemsStream()) {
+  // Each model item is complete; completed tool results arrive between steps.
+  console.log(item);
+}
+```
+
+HTTP/connection retries remain owned by the standard client SDK's `retryConfig`.
+The agent supplies retryable HTTP codes 408/409/425/429/5xx; request-level
+`retryCodes` can override them.
+The agent's `responseRetries` (default 2, range 0–10) applies only to retryable
+failed JSON response bodies, including error-only HTTP-200 bodies. It never
+restarts exhausted HTTP retries, retries permanent provider errors, or replays a
+stream that may have exposed output. Retries use backoff with jitter (starting
+at 500 ms, capped at 5 seconds); a provider retry delay above 60 seconds is
+surfaced for later recovery. Each model step has its own allowance. One request
+deadline covers HTTP recovery, JSON-response retries and backoff. The caller's
+abort signal also stops backoff. Completed tools are never re-executed by model
+request recovery, and failed response output is never committed.
+
+`ModelRequestError` exposes `details.source`, provider `code`, HTTP `status`,
+`responseId`, `requestId`, `errorType` and the original cause where available.
+`isRetryableModelError(error)` shares the classification with callers. Streamed
+provider failures retain the same structured diagnostics. Application-specific
+context transformation, approvals and durable/manual run recovery remain owned
+by the application.
+
 #### Replay history for stream consumers
 
 Every stream getter above can start from event zero, so by default a result

@@ -55,6 +55,8 @@ import {
 } from './doom-loop.js';
 import type { HooksManager } from './hooks-manager.js';
 import type { ModelCallUsage, PostModelCallPayload, SessionUsageTotals } from './hooks-types.js';
+import type { ModelRetryEvent } from './model-errors.js';
+import { modelResponseError, normalizeModelError, waitForModelRetry } from './model-errors.js';
 import {
   applyNextTurnParamsToRequest,
   executeNextTurnParamsFunctions,
@@ -472,6 +474,8 @@ export interface GetResponseOptions<
   /** Callback invoked at the end of each tool execution turn */
   onTurnEnd?: (context: TurnContext, response: models.OpenResponsesResult) => void | Promise<void>;
   /** Replay history retained for delayed and sequential stream consumers. */
+  responseRetries?: number;
+  onModelRetry?: (event: ModelRetryEvent) => void | Promise<void>;
   streamReplay?: StreamReplay;
   /**
    * When the loop exits because `stopWhen` was met and the last response
@@ -954,9 +958,8 @@ export class ModelResult<
     }
 
     if (isResponseFailedEvent(event)) {
-      this.initialResponseError = new Error(
-        `Response failed: ${JSON.stringify(event.response.error)}`,
-      );
+      this.initialResponseError =
+        modelResponseError(event.response) ?? normalizeModelError(new Error('Response failed'));
     }
   }
 
@@ -995,8 +998,9 @@ export class ModelResult<
         completedResponse = event.response;
       }
       if (isResponseFailedEvent(event)) {
-        const errorMsg = 'message' in event ? String(event.message) : 'Response failed';
-        throw new Error(errorMsg);
+        throw (
+          modelResponseError(event.response) ?? normalizeModelError(new Error('Response failed'))
+        );
       }
       if (isResponseIncompleteEvent(event)) {
         completedResponse = event.response;
@@ -1115,6 +1119,100 @@ export class ModelResult<
     };
   }
 
+  /** One model step: transport retries stay in the client; only failed JSON bodies are retried here. */
+  private async sendModelRequest(request: models.ResponsesRequest) {
+    const options = this.dispatchRequestOptions();
+    const retries = this.options.responseRetries ?? 2;
+    if (!Number.isInteger(retries) || retries < 0 || retries > 10) {
+      throw new RangeError('responseRetries must be an integer between 0 and 10');
+    }
+    for (let attempt = 0; ; attempt += 1) {
+      options?.signal?.throwIfAborted();
+      let result: Awaited<ReturnType<typeof betaResponsesSend>>;
+      try {
+        const pending = betaResponsesSend(
+          this.options.client,
+          {
+            responsesRequest: request,
+          },
+          options,
+        );
+        // APIPromise has a separate unwrapped rejection branch. Observe it too:
+        // parse failures otherwise escape even though the awaited branch is caught.
+        void pending.catch(() => {});
+        result = await pending;
+      } catch (error) {
+        options?.signal?.throwIfAborted();
+        throw normalizeModelError(error);
+      }
+      options?.signal?.throwIfAborted();
+      const error = result.ok
+        ? modelResponseError(result.value)
+        : normalizeModelError(result.error);
+      if (!error) {
+        return result;
+      }
+      // HTTP failures have already exhausted the client retry policy. Streaming
+      // failures may have exposed partial output, so never replay them here.
+      if (
+        request.stream !== false ||
+        error.details.source !== 'response' ||
+        !error.recoverable ||
+        (error.details.retryAfterMs ?? 0) > 60_000 ||
+        attempt >= retries
+      ) {
+        throw error;
+      }
+      const delayMs = Math.max(
+        error.details.retryAfterMs ?? 0,
+        Math.min(500 * 2 ** attempt, 5_000) + Math.floor(Math.random() * 250),
+      );
+      await this.options.onModelRetry?.({
+        error,
+        attempt: attempt + 1,
+        delayMs,
+      });
+      await waitForModelRetry(delayMs, options?.signal ?? undefined);
+    }
+  }
+
+  /** Bridge complete JSON responses to the existing completed-item/progress APIs. No token deltas. */
+  private completedResponseStream(
+    response: models.OpenResponsesResult,
+  ): ReadableStream<models.StreamEvents> {
+    const error = modelResponseError(response);
+    if (error) {
+      throw error;
+    }
+    return new ReadableStream({
+      start(controller) {
+        let sequenceNumber = 0;
+        for (const [outputIndex, item] of response.output.entries()) {
+          controller.enqueue({
+            type: 'response.output_item.done',
+            sequenceNumber: sequenceNumber++,
+            outputIndex,
+            item,
+          });
+        }
+        controller.enqueue(
+          response.status === 'incomplete'
+            ? {
+                type: 'response.incomplete',
+                sequenceNumber,
+                response,
+              }
+            : {
+                type: 'response.completed',
+                sequenceNumber,
+                response,
+              },
+        );
+        controller.close();
+      },
+    });
+  }
+
   /**
    * Type guard to check if a value is a non-streaming response
    * Only requires 'output' field and absence of readable stream behavior
@@ -1145,7 +1243,7 @@ export class ModelResult<
       return consumeStreamForCompletion(stream);
     }
     if (this.isNonStreamingResponse(value)) {
-      return value;
+      return this.materializeResponse(this.completedResponseStream(value), turnNumber);
     }
     throw new Error('Unexpected response type from API');
   }
@@ -4870,18 +4968,12 @@ export class ModelResult<
     const newRequest: models.ResponsesRequest = {
       ...this.resolvedRequest,
       ...(escalationOverrides ?? {}),
-      stream: true,
+      stream: this.resolvedRequest?.stream ?? this.options.request.stream ?? true,
     };
 
     this.beginToolChoiceDispatch(newRequest.toolChoice);
     const startedAt = performance.now();
-    const newResult = await betaResponsesSend(
-      this.options.client,
-      {
-        responsesRequest: newRequest,
-      },
-      this.dispatchRequestOptions(),
-    );
+    const newResult = await this.sendModelRequest(newRequest);
 
     if (!newResult.ok) {
       throw newResult.error;
@@ -5172,18 +5264,12 @@ export class ModelResult<
         toolChoice: 'none' as const,
       }),
       input: newInput,
-      stream: true,
+      stream: this.resolvedRequest?.stream ?? this.options.request.stream ?? true,
     };
     this.resolvedRequest = finalRequest;
 
     const startedAt = performance.now();
-    const result = await betaResponsesSend(
-      this.options.client,
-      {
-        responsesRequest: finalRequest,
-      },
-      this.dispatchRequestOptions(),
-    );
+    const result = await this.sendModelRequest(finalRequest);
 
     if (!result.ok) {
       throw result.error;
@@ -5259,17 +5345,11 @@ export class ModelResult<
       ...(this.resolvedRequest.tools !== undefined && {
         toolChoice: 'none' as const,
       }),
-      stream: true,
+      stream: this.resolvedRequest?.stream ?? this.options.request.stream ?? true,
     };
 
     const startedAt = performance.now();
-    const newResult = await betaResponsesSend(
-      this.options.client,
-      {
-        responsesRequest: newRequest,
-      },
-      this.dispatchRequestOptions(),
-    );
+    const newResult = await this.sendModelRequest(newRequest);
 
     if (!newResult.ok) {
       throw newResult.error;
@@ -5296,16 +5376,26 @@ export class ModelResult<
    * signal throws its abort reason here, before any network I/O.
    */
   private dispatchRequestOptions(): RequestOptions | undefined {
-    const base = this.options.options;
+    // The client owns these retries, including throttling; never duplicate them
+    // in the failed-response loop above. Callers can override retryCodes.
+    const base = {
+      ...this.options.options,
+      retryCodes: this.options.options?.retryCodes ?? [
+        '408',
+        '409',
+        '425',
+        '429',
+        '5XX',
+      ],
+    };
     const runSignal = this.options.signal;
-    if (!runSignal) {
-      return base;
-    }
-    runSignal.throwIfAborted();
+    runSignal?.throwIfAborted();
 
-    const signals: AbortSignal[] = [
-      runSignal,
-    ];
+    const signals: AbortSignal[] = runSignal
+      ? [
+          runSignal,
+        ]
+      : [];
     const callerSignal = base?.signal ?? base?.fetchOptions?.signal;
     if (callerSignal) {
       signals.push(callerSignal);
@@ -5313,13 +5403,16 @@ export class ModelResult<
     // Re-create the timeout the SDK would have wired had no signal been
     // present. Per-request option wins over the client-level default,
     // mirroring betaResponsesSend's own precedence.
-    const timeoutMs = base?.timeoutMs ?? this.options.client._options.timeoutMs;
+    const timeoutMs = base?.timeoutMs ?? this.options.client._options?.timeoutMs;
     if (typeof timeoutMs === 'number' && timeoutMs > 0) {
       signals.push(AbortSignal.timeout(timeoutMs));
     }
+    if (signals.length === 0) {
+      return base;
+    }
     return {
       ...base,
-      signal: signals.length === 1 ? runSignal : AbortSignal.any(signals),
+      signal: signals.length === 1 ? signals[0]! : AbortSignal.any(signals),
     };
   }
 
@@ -5925,7 +6018,7 @@ export class ModelResult<
       // Store resolved request with stream mode
       this.resolvedRequest = {
         ...baseRequest,
-        stream: true as const,
+        stream: baseRequest.stream ?? true,
       };
 
       // Force stream mode for initial request
@@ -5942,13 +6035,7 @@ export class ModelResult<
 
       // Make the API request
       this.beginToolChoiceDispatch(request.toolChoice);
-      const apiResult = await betaResponsesSend(
-        this.options.client,
-        {
-          responsesRequest: request,
-        },
-        this.dispatchRequestOptions(),
-      );
+      const apiResult = await this.sendModelRequest(request);
 
       if (!apiResult.ok) {
         throw apiResult.error;
@@ -5968,8 +6055,7 @@ export class ModelResult<
         this.setReusableStream(apiResult.value);
       } else if (this.isNonStreamingResponse(apiResult.value)) {
         // API returned a complete response directly - use it as the final response
-        this.finalResponse = apiResult.value;
-        await this.emitPendingModelCallOnce(this.finalResponse);
+        this.setReusableStream(this.completedResponseStream(apiResult.value));
       } else {
         throw new Error('Unexpected response type from API');
       }
@@ -6244,7 +6330,7 @@ export class ModelResult<
     const request: models.ResponsesRequest = {
       ...baseRequest,
       input: newInput,
-      stream: true,
+      stream: this.resolvedRequest?.stream ?? this.options.request.stream ?? true,
     };
 
     this.resolvedRequest = request;
@@ -6258,13 +6344,7 @@ export class ModelResult<
 
     // Make the API request
     this.beginToolChoiceDispatch(request.toolChoice);
-    const apiResult = await betaResponsesSend(
-      this.options.client,
-      {
-        responsesRequest: request,
-      },
-      this.dispatchRequestOptions(),
-    );
+    const apiResult = await this.sendModelRequest(request);
 
     if (!apiResult.ok) {
       throw apiResult.error;
@@ -6274,8 +6354,7 @@ export class ModelResult<
     if (isEventStream(apiResult.value)) {
       this.setReusableStream(apiResult.value);
     } else if (this.isNonStreamingResponse(apiResult.value)) {
-      this.finalResponse = apiResult.value;
-      await this.emitPendingModelCallOnce(this.finalResponse);
+      this.setReusableStream(this.completedResponseStream(apiResult.value));
     } else {
       throw new Error('Unexpected response type from API');
     }

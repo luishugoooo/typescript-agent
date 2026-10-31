@@ -6,6 +6,7 @@ import type {
   ClaudeTextCitation,
   UnsupportedContent,
 } from '../api-shape-helpers/claude-message.js';
+import { modelResponseError, normalizeModelError } from './model-errors.js';
 import type { ReusableReadableStream } from './reusable-stream.js';
 import {
   isFileCitationAnnotation,
@@ -662,7 +663,9 @@ export function extractCompletionFromBuffer(
   const terminal = findBufferedTerminalEvent(stream);
 
   if (terminal && isResponseFailedEvent(terminal)) {
-    throw new Error(`Response failed: ${JSON.stringify(terminal.response.error)}`);
+    throw (
+      modelResponseError(terminal.response) ?? normalizeModelError(new Error('Response failed'))
+    );
   }
   if (terminal && (isResponseCompletedEvent(terminal) || isResponseIncompleteEvent(terminal))) {
     return terminal.response;
@@ -709,7 +712,7 @@ export async function consumeStreamForCompletion(
 
     if (isResponseFailedEvent(event)) {
       // The failed event contains the full response with error information
-      throw new Error(`Response failed: ${JSON.stringify(event.response.error)}`);
+      throw modelResponseError(event.response) ?? normalizeModelError(new Error('Response failed'));
     }
 
     if (isResponseIncompleteEvent(event)) {

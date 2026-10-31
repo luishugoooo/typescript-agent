@@ -251,7 +251,7 @@ describe('run-level signal (callModel `signal`)', () => {
 });
 
 describe('per-request timeoutMs composition', () => {
-  it('timeoutMs alone passes through untouched (SDK wires its own timeout)', async () => {
+  it('timeoutMs alone creates a deadline shared by response retries', async () => {
     mockBetaResponsesSend.mockResolvedValueOnce({
       ok: true,
       value: textTurn('ok'),
@@ -270,9 +270,9 @@ describe('per-request timeoutMs composition', () => {
 
     const options = dispatchOptions(0);
     expect(options.timeoutMs).toBe(5000);
-    // No run signal ⇒ no composition; the SDK sees no signal and applies
-    // timeoutMs itself.
-    expect(options.signal).toBeUndefined();
+    // One deadline includes SDK recovery and response-retry backoff.
+    expect(options.signal).toBeInstanceOf(AbortSignal);
+    expect(options.signal?.aborted).toBe(false);
   });
 
   // NOTE on real timers (documented exception to the fake-timer rule): the

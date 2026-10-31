@@ -83,6 +83,12 @@ type BaseCallModelInput<
   >;
 } & {
   input: FieldOrAsyncFunction<Item[]> | string;
+  /** Receive complete JSON responses. Streaming remains the default. */
+  stream?: boolean;
+  /** Retries of failed JSON response bodies per model step; HTTP retries belong to the client. Default 2. */
+  responseRetries?: number;
+  /** Observe response retries without owning the retry loop. */
+  onModelRetry?: (event: import('./model-errors.js').ModelRetryEvent) => void | Promise<void>;
   tools?: TTools;
   /**
    * Optional filter restricting which tools are exposed to the model for this
@@ -293,7 +299,7 @@ export type CallModelInputWithState<
  * Resolved CallModelInput (all functions evaluated to values)
  * This is the type after all async functions have been resolved to their values
  */
-export type ResolvedCallModelInput = Omit<models.ResponsesRequest, 'stream' | 'tools'> & {
+export type ResolvedCallModelInput = Omit<models.ResponsesRequest, 'tools'> & {
   tools?: never;
 };
 
@@ -340,6 +346,8 @@ export async function resolveAsyncFunctions<TTools extends readonly Tool[] = rea
     'sharedContextSchema', // Client-side schema for shared context validation
     'onTurnStart', // Client-side turn start callback
     'onTurnEnd', // Client-side turn end callback
+    'responseRetries',
+    'onModelRetry',
     'streamReplay', // Client-side stream replay policy
     'allowFinalResponse', // Client-side: tunes the default toolChoice:'none' final turn when stopWhen breaks the loop
     'strictFinalResponse', // Client-side: restore throw on empty final after tool rounds
